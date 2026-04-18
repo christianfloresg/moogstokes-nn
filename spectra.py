@@ -11,7 +11,10 @@ TODO:
 
 import os
 import hashlib
+from typing import Union
 import numpy as np
+import matplotlib.pyplot as plt
+
 from scipy.interpolate import interp1d
 from fnmatch import fnmatch
 from astropy.io import fits
@@ -19,7 +22,7 @@ from numpy.typing import NDArray
 from scipy.signal import savgol_filter
 from spectrograph_functions import instrumental_response
 
-class ProplydData:
+class SpectralData:
     """Stores spectra of science targets.
 
     Attributes
@@ -35,7 +38,7 @@ class ProplydData:
     """
 
     def __init__(self, fname: str, name: str | None = None) -> None:
-        """Initializes the ProplydData object by reading in data from
+        """Initializes the SpectralData object by reading in data from
         a file.
         
         If the name is not specified, it will be set by splitting the file
@@ -126,7 +129,7 @@ class ProplydData:
         self.yerr_scaling *= factor
         print(f"[yerr rescaled] Factor applied: {factor}. Total scaling so far: {self.yerr_scaling}")
 
-    def Nyquist_bin_spectrum(self, N: int = 3) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def Nyquist_bin_spectrum(self, N: int = 3) -> None:
         """
         Bin the spectrum by grouping every N pixels. Overwrites the object's
         wavelength, flux, and error arrays in place. The error is propagated as
@@ -362,8 +365,8 @@ class MoogStokesModel(ModelSpectrum):
             - True -> two-level hash directory structure for large model sets.
         """
         rK = 0  # veiling is always 0
-        Teff = int(Teff)
-        logg = int(logg * 1000)
+        Teff = int( Teff )
+        logg = int( round(logg * 1000) )
 
         dirname = f'iSHELL_0.75K2_T{Teff:d}_G{logg:d}_Veil{rK:.3f}_Bf{B:.3f}_vsin{vsini:.3f}'
         basename = f'model_best_fit_params_wave_region_{region:d}.nspec'
@@ -432,6 +435,19 @@ class MoogStokesModel(ModelSpectrum):
             
         self.apply_veiling(self.rK)
         self.x *= 1e4  # convert microns to Angstroms
+
+    def _make_uninitialized(self, Teff: float, logg: float, rK: float, B: float, vsini: float,
+                 region: int, use_interpolated: bool = True) -> None:
+        """Same as constructor but without loading a model from a file. Used for
+        neural network.
+        """
+        super().__init__(Teff, logg, rK, B, vsini)
+        self.use_interpolated = use_interpolated
+        self.region = region
+
+        self._res_backup = None  # store originals if we change resolution
+        self._res_applied = False  # simple guard
+        self._res_params = None  # remember last params (optional)
 
     def update_models_dirs_and_reload(self, models_dir: str, models_itp_dir: str):
         self.models_dir = models_dir
@@ -610,3 +626,118 @@ class BTSettlModel(ModelSpectrum):
         """
         fname = self.get_norm_template_fname(Teff, logg, mode)
         return self.retrieve_template_data(fname)
+    
+def setup_regions_plot(label_regions=True):
+    """
+    Returns
+    -------
+    fig, axs : matplotlib Figure and Axes
+        Figure and Axes objects for the regions plot.
+    """
+    Nreg = MoogStokesModel.NUM_REGIONS
+    Nsub = Nreg  # number of subplots
+    if Nreg % 2 != 0:
+        Nsub += 1  ## need
+    
+    fig, axs = plt.subplots(nrows=Nsub//2, ncols=2, figsize=(8.5,7))
+    axs = axs.reshape(-1)
+
+    for r, ax in enumerate(axs):
+        if (Nreg % 2 != 0) and r == Nsub - 1:
+            ax.axis("off")
+            continue
+        ax.set_ylim(0.6, 1.05)
+        xlo, xhi = MoogStokesModel.region_xlims(r)
+        ax.set_xlim(xlo, xhi)
+
+        if label_regions:
+            ax.text(0.81, 0.05, f"Region {r}", transform=ax.transAxes, color='k')
+        
+    fig.supxlabel(r"Wavelength ($\AA$)")
+    fig.supylabel(r"Normalized Flux Density")
+    plt.tight_layout()
+
+    if Nreg % 2 != 0: # If an odd number, remove the last subplot
+        axs_new = axs[:-1]
+    else:
+        axs_new = axs
+    return fig, axs_new
+
+class SpectralDataForMoogStokes(SpectralData):
+
+    def __init__(self, fname: str, name: str | None = None, renormalization: NDArray | None = None,
+                shifts: NDArray | None = None, regions: Union[range, list[int]] | None = None,
+                resolution: float | None = None, kernel: str | None = None) -> None:
+        
+        if regions is None:
+            regions = range(7)
+
+        if shifts is None:
+            shifts = np.zeros(len(regions))
+
+        if renormalization is None:
+            renormalization = np.ones(len(regions))
+
+        super().__init__(fname, name=name)
+
+        self.regions = regions
+        self.renormalization = renormalization
+        self.shifts = shifts
+        self.resolution = resolution
+        self.kernel = kernel
+
+        self.generate_moog_regions()
+
+    def generate_moog_regions(self):
+        
+        p = 50 # number of pixels to pad on either side for Doppler shifts
+        self.moog_regions = {}
+        for r in self.regions:
+            xlo, xhi = MoogStokesModel.region_xlims(r)
+            xreg, yreg, yerrreg = self.get_range(xlo - 150, xhi + 150)
+
+            yreg *= self.renormalization[r]
+            yerrreg *= self.renormalization[r]
+
+            # Doppler shifts
+            yreg_pad = np.pad(yreg, p, constant_values=1)
+            yerrreg_pad = np.pad(yerrreg, p, constant_values=1)
+            yreg_shifted = np.roll(yreg_pad, int(self.shifts[r]))[p:-p]
+            yerrreg_shifted = np.roll(yerrreg_pad, int(self.shifts[r]))[p:-p]
+
+         # Crop down to original region limits
+            xreg_mask = (xreg >= xlo) & (xreg <= xhi)
+            xreg = xreg[xreg_mask]
+            yreg_shifted = yreg_shifted[xreg_mask]
+            yerrreg_shifted = yerrreg_shifted[xreg_mask]
+
+            self.moog_regions[r] = (xreg, yreg_shifted, yerrreg_shifted)
+
+    def get_region(self, r):
+        return self.moog_regions[r]
+
+    def doppler_shift_data(self, shift: int, p: int = 50, fill_value: float = 1):
+        super().doppler_shift_data(shift, p, fill_value)
+        self.generate_moog_regions()
+    
+    def rescale_yerr(self, factor: float):
+        super().rescale_yerr(factor)
+        self.generate_moog_regions()
+    
+    def Nyquist_bin_spectrum(self, N: int = 3) -> None:
+        super().Nyquist_bin_spectrum(N)
+        self.generate_moog_regions()
+
+    def renormalize(self, factor: float):
+        super().renormalize(factor)
+        self.generate_moog_regions()
+
+    def resolution_change(self, *, resolution, Kernel='box', reference_wavelength=None, force=False, remember_original=True):
+        super().resolution_change(resolution=resolution, Kernel=Kernel,
+                                reference_wavelength=reference_wavelength,
+                                force=force, remember_original=remember_original)
+        self.generate_moog_regions()
+
+    def resolution_reset(self):
+        super().resolution_reset()
+        self.generate_moog_regions()

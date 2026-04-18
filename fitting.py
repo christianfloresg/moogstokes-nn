@@ -7,10 +7,9 @@ import numpy as np
 
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
-from spectra import ProplydData, MoogStokesModel, BTSettlModel
+from spectra import SpectralData, MoogStokesModel, BTSettlModel, setup_regions_plot
 from astropy.io import fits
 from interpolate_moogstokes import interpolate_moogstokes_models
-from plotting_fuctions import setup_regions_plot
 
 def chi_squared(ydata: NDArray, yerrdata: NDArray, ymodel: NDArray) -> float:
     """Calculate the chi-squared statistic for the given data and model spectrum.
@@ -18,7 +17,7 @@ def chi_squared(ydata: NDArray, yerrdata: NDArray, ymodel: NDArray) -> float:
     """
     return np.nansum((ydata-ymodel)**2/yerrdata**2)
 
-def compute_moogstokes_chi2_grid(data: ProplydData, Teff_vals: NDArray, logg_vals:
+def compute_moogstokes_chi2_grid(data: SpectralData, Teff_vals: NDArray, logg_vals:
                                  NDArray, rK_vals: NDArray, vsini_vals: NDArray,
                                  B_vals: NDArray, renormalization: NDArray | None = None,
                                  shifts: NDArray | None = None, regions: list[int] | None = None,
@@ -31,7 +30,7 @@ def compute_moogstokes_chi2_grid(data: ProplydData, Teff_vals: NDArray, logg_val
 
     Parameters
     ----------
-    data: ProplydData
+    data: SpectralData
         Science data to fit.
     Teff_vals: NDArray
         Effective temperatures across the grid.
@@ -154,7 +153,7 @@ def compute_reduced_chi2_bestfit(
 
     Parameters
     ----------
-    data : ProplydData
+    data : SpectralData
         The observed data object.
     best_params : tuple
         Best-fit parameters: (Teff, logg, rK, vsini, B)
@@ -203,14 +202,14 @@ def compute_reduced_chi2_bestfit(
 
     return reduced_chi2
 
-def automatic_wavelength_shifts_values(data: ProplydData, Teff: float, logg:
+def automatic_wavelength_shifts_values(data: SpectralData, Teff: float, logg:
                                 float, rK: float, vsini: float,
                                  B: float, guess_shift: int, regions: list[int] | None = None) -> NDArray:
 
     """
     find the best pixel shifts for a specified number of regions for a given model.
     The values of the model are not too important as the lines detected and observed are there.
-    :param data: ProplydData
+    :param data: SpectralData
         Observed data object.
     :param Teff: 
     :param logg: 
@@ -364,7 +363,7 @@ def write_grid_to_fits(
         Result arrays from the grid search.
     regions : sequence
         Region identifiers.
-    data : ProplydData
+    data : SpectralData
         Data object containing metadata.
     resolution : float, optional
         Instrument resolution.
@@ -416,7 +415,7 @@ def write_grid_to_fits(
     return os.path.abspath(fname)
 
 
-def compute_moogstokes_chi2_grid_upsample(data: ProplydData, grid_vals: dict,
+def compute_moogstokes_chi2_grid_upsample(data: SpectralData, grid_vals: dict,
                                 num_iter: int, upsamp_factors: dict, steps: dict,
                                 interpolation_bounds: dict | None = None,
                                 renormalization: NDArray | None = None,
@@ -595,7 +594,7 @@ class FittedModel:
         self._make_uncertainties(interpolate=interpolate_chi2)
         self._make_best_model(interpolation_bounds=interpolation_bounds)
 
-        self.data = ProplydData(self.data_fname, name=self.name)
+        self.data = SpectralData(self.data_fname, name=self.name)
         yerr_scaling = hdr.get("YERSCL", 1.0)
         self.data.rescale_yerr(yerr_scaling)
         

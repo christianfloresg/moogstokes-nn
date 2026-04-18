@@ -1,8 +1,13 @@
+import os
 import numpy as np
 import torch
+import torch.nn as nn
+
+from typing import Union
 from torch.utils.data import Dataset
 from numpy.typing import NDArray
 from scipy.stats import qmc
+from scipy.signal import savgol_filter
 from spectra import MoogStokesModel
 
 class ParamScaler:
@@ -17,6 +22,13 @@ class ParamScaler:
         "vsini": {"min": 2, "max": 47, "var": 10},
     }
     param_order = ["Teff", "logg", "B", "vsini"]
+    param_units = {
+        "Teff": "K",
+        "logg": "dex",
+        "B": "kG",
+        "vsini": "km/s"
+    }
+    num_params = len(param_order)
 
     def physical_to_nn(self, p: dict | NDArray) -> dict | NDArray:
         """Normalizes physical parameters to be more suitable for the neural network.
@@ -90,7 +102,7 @@ def make_sobol_samples(N_params: int, m_sobol: int, p_lower: dict, p_upper: dict
     -------
     samples_physical : NDArray
         The generated samples in physical parameter space.
-    samples_nn : NDArray
+    samples_nn : NDArray 
         The generated samples in NN parameter space.
     """
     N_models = 2**m_sobol
@@ -122,11 +134,12 @@ def make_sobol_samples(N_params: int, m_sobol: int, p_lower: dict, p_upper: dict
 class MoogStokesTorchDataset(Dataset):
 
     model_class = MoogStokesModel
-    models_dir = "data/moog-stokes-itp/"
+    models_dir = "data/moog-stokes-train/"
 
-    def __init__(self, fname_params: str, region: str, fname_region_sizes: str = "data/region_sizes.txt"):
-        region_sizes = np.loadtxt(fname_region_sizes, skiprows=1)[:, 1].astype(int)
-
+    def __init__(self, fname_params: str, region: str, fname_region_info: str = "data/region_info.txt"):
+        
+        region_info = np.loadtxt(fname_region_info).T
+        region_sizes = region_info[1].astype(int)
         self.params = np.loadtxt(fname_params, skiprows=1)
         self.num_wavelengths = region_sizes[region]
         self.region = region
@@ -141,7 +154,7 @@ class MoogStokesTorchDataset(Dataset):
                 vsini = row[3],
                 region = region,
                 models_dir = self.models_dir,
-                use_hash = True
+                use_hash = False
             )
             self.fnames.append(fname)
         self.fnames = np.array(self.fnames)
@@ -166,3 +179,121 @@ class MoogStokesTorchDataset(Dataset):
         flux_tensor = torch.tensor(flux, dtype=torch.float32)
 
         return p_nn_tensor, flux_tensor
+    
+class SpectralInterpolatorNeuralNetwork(nn.Module):
+    def __init__(self, num_params, num_wavelengths):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.linear_relu_stack = nn.Sequential(
+            nn.Linear(num_params, 64),
+            #nn.LeakyReLU(0.01),
+            nn.GELU(),
+            nn.LayerNorm(64),
+
+            nn.Linear(64, 128),
+            #nn.LeakyReLU(0.01),
+            nn.GELU(),
+            nn.LayerNorm(128),
+
+            nn.Linear(128, 256),
+            #nn.LeakyReLU(0.01),
+            nn.GELU(),
+            nn.LayerNorm(256),
+
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+
+            nn.Linear(512, num_wavelengths),
+        )
+
+    def forward(self, x):
+        x = self.flatten(x)
+        logits = self.linear_relu_stack(x)
+        return logits
+    
+class MoogStokesNN:
+
+    # In which ranges of parameters should we trust the neural network? Depends
+    # on training dataset and validation plots.
+
+    @classmethod
+    def get_valid_bounds(cls, param_name: str) -> tuple[float, float]:
+        valid_bounds = {
+            "Teff": (3200, 7000),
+            "vsini": (2, 42),
+            "logg": (2.5, 5.0),
+            "B": (0, 3.0)
+        }
+        return valid_bounds["param_name"]
+
+    # Imports the neural networks once, then generates MoogStokesModels on the fly    
+    def __init__(self, architecture = SpectralInterpolatorNeuralNetwork, nn_models_dir: str = "data/",
+                 regions: Union[range, list[int]] = range(7)) -> None:
+        """Initializes the MoogStokesNN object by importing trained models.
+
+        Parameters
+        ----------
+        architecture: nn.Module
+            The architecture of the neural network to use. Must be the same as
+            the one used for training.
+        nn_models_dir: str
+            The directory where the trained neural network model files are stored.
+            The files should be named "nn_region_{i}.pt" where i is the region
+            number (0-6).
+        regions: range or list of int
+            The regions to import. Should be a subset of range(7) since there
+            are 7 regions in total.
+        """
+        self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        self.nn_model_files = [ os.path.join(nn_models_dir, f"nn_region_{i}.pt") for i in regions ]
+        region_info = np.loadtxt("data/region_info.txt", skiprows=1)
+        self.region_sizes = { int(row[0]): int(row[1]) for row in region_info }
+        self.region_xlims = { int(row[0]): (row[2], row[3]) for row in region_info }
+
+        n_params = ParamScaler().num_params  # number of inputs to the neural network
+
+        self.nns = {}
+        for r in regions:
+            model = architecture(num_params=n_params, num_wavelengths=self.region_sizes[r])
+            model.load_state_dict(torch.load(self.nn_model_files[r], weights_only=True))
+            model.eval()
+            self.nns[r] = model
+
+    def make_moogstokes_model(self, Teff: float, logg: float, rK: float, B: float,
+                              vsini: float, region: int) -> MoogStokesModel:
+        
+        scaler = ParamScaler()
+        p_phys = np.array([Teff, logg, B, vsini])
+        p_nn = scaler.physical_to_nn(p_phys)
+        x = torch.tensor(p_nn, dtype=torch.float32).unsqueeze(0)  # add batch dimension
+
+        nn = self.nns[region]
+        with torch.no_grad():
+            x = x.to(self.device)
+            pred = nn(x)
+            y_pred = pred.cpu().numpy()[0]
+            # smooth noise in the predicted spectrum
+            y_pred = savgol_filter(y_pred, window_length=11, polyorder=3)
+
+        # Make a MoogStokesModel object, but skip the __init__ as we are not
+        # importing from a file
+        moog = MoogStokesModel.__new__(MoogStokesModel)
+        moog._make_uninitialized(Teff, logg, rK, B, vsini, region)
+
+        xlo = self.region_xlims[region][0]
+        xhi = self.region_xlims[region][1]
+        moog.x = np.linspace(xlo, xhi, self.region_sizes[region])
+        moog.y = y_pred
+        moog.x *= 1e4
+        moog.apply_veiling(rK)
+
+        return moog
