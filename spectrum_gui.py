@@ -22,7 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_REGIONS   = 7
 PARAMS_FILE = "data/spectrum_params.csv"
-KERNELS     = ["box", "SPEX", "KECK", "IGRINS", None]
+KERNELS     = ["box", "SPEX", "KECK", "IGRINS", "iSHELL0.75K2", None]
 BTN         = dict(fg="black", bg="#d9d9d9", activeforeground="black",
                    activebackground="#c0c0c0", relief="raised", padx=6, pady=2)
 CSV_COLS    = (

@@ -46,13 +46,13 @@ class ParamScaler:
             p_dict = dict(zip(self.param_order, p))
             p_scaled_dict = self.physical_to_nn(p_dict)
             return np.array([p_scaled_dict[k] for k in self.param_order])
-        
+
         p = p.copy()  # avoid modifying the original dictionary
         for param, scaling in self.param_scaling.items():
             p_mean = np.mean([scaling["min"], scaling["max"]])
             p[param] = (p[param] - p_mean) / scaling["var"]
         return p
-        
+
     def nn_to_physical(self, p: dict | NDArray) -> dict | NDArray:
         """Converts neural network outputs back to physical parameters.
         """
@@ -66,7 +66,7 @@ class ParamScaler:
             p_mean = np.mean([scaling["min"], scaling["max"]])
             p[param] = p[param] * scaling["var"] + p_mean
         return p
-    
+
 def save_params_to_txt(params: NDArray, fname: str) -> None:
 
     with open(fname, "w") as f:
@@ -102,7 +102,7 @@ def make_sobol_samples(N_params: int, m_sobol: int, p_lower: dict, p_upper: dict
     -------
     samples_physical : NDArray
         The generated samples in physical parameter space.
-    samples_nn : NDArray 
+    samples_nn : NDArray
         The generated samples in NN parameter space.
     """
     N_models = 2**m_sobol
@@ -137,7 +137,7 @@ class MoogStokesTorchDataset(Dataset):
     models_dir = "data/moog-stokes-train/"
 
     def __init__(self, fname_params: str, region: str, fname_region_info: str = "data/region_info.txt"):
-        
+
         region_info = np.loadtxt(fname_region_info).T
         region_sizes = region_info[1].astype(int)
         self.params = np.loadtxt(fname_params, skiprows=1)
@@ -166,7 +166,7 @@ class MoogStokesTorchDataset(Dataset):
             p_phys_dict = {k: p_phys[j] for j, k in enumerate(order)}
             p_nn_dict = scaler.physical_to_nn(p_phys_dict)
             self.params_nn[i] = np.array([p_nn_dict[k] for k in order])
-            
+
     def __len__(self):
         return len(self.params)
 
@@ -179,7 +179,7 @@ class MoogStokesTorchDataset(Dataset):
         flux_tensor = torch.tensor(flux, dtype=torch.float32)
 
         return p_nn_tensor, flux_tensor
-    
+
 class SpectralInterpolatorNeuralNetwork(nn.Module):
     def __init__(self, num_params, num_wavelengths):
         super().__init__()
@@ -216,7 +216,7 @@ class SpectralInterpolatorNeuralNetwork(nn.Module):
         x = self.flatten(x)
         logits = self.linear_relu_stack(x)
         return logits
-    
+
 class MoogStokesNN:
 
     # In which ranges of parameters should we trust the neural network? Depends
@@ -232,7 +232,7 @@ class MoogStokesNN:
         }
         return valid_bounds["param_name"]
 
-    # Imports the neural networks once, then generates MoogStokesModels on the fly    
+    # Imports the neural networks once, then generates MoogStokesModels on the fly
     def __init__(self, architecture = SpectralInterpolatorNeuralNetwork, nn_models_dir: str = "data/",
                  regions: Union[range, list[int]] = range(7)) -> None:
         """Initializes the MoogStokesNN object by importing trained models.
@@ -250,7 +250,8 @@ class MoogStokesNN:
             The regions to import. Should be a subset of range(7) since there
             are 7 regions in total.
         """
-        self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        # self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        self.device = "cpu"
         self.nn_model_files = [ os.path.join(nn_models_dir, f"nn_region_{i}.pt") for i in regions ]
         region_info = np.loadtxt("data/region_info.txt", skiprows=1)
         self.region_sizes = { int(row[0]): int(row[1]) for row in region_info }
@@ -267,7 +268,7 @@ class MoogStokesNN:
 
     def make_moogstokes_model(self, Teff: float, logg: float, rK: float, B: float,
                               vsini: float, region: int) -> MoogStokesModel:
-        
+
         scaler = ParamScaler()
         p_phys = np.array([Teff, logg, B, vsini])
         p_nn = scaler.physical_to_nn(p_phys)

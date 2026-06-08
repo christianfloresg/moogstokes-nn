@@ -52,7 +52,7 @@ def instrumental_response(flux, wavelength, resolution, Kernel='box', reference_
 
     elif Kernel == 'KECK':
         """
-        Convolve the data with the analytical form obtained for iSHELL K2 0.375''
+        Convolve the data with the analytical form obtained for KECK data''
         """
 
         L_fwhm=0.043
@@ -85,6 +85,34 @@ def instrumental_response(flux, wavelength, resolution, Kernel='box', reference_
 
     # kernel = kernel_not_normalized/ sum(kernel_not_normalized)
     # kernel = kernel_not_normalized
+
+    elif Kernel == 'iSHELL0.75K2':
+        """
+        Convolve the data with the analytical form obtained for iSHELL K2 0.75''
+        """
+        L_fwhm=0.043
+        G_fwhm=0.246
+        B_fwhm=0.449
+        pixel_spacing=resolution
+
+        sigma_g = (G_fwhm/pixel_spacing) / (2 * np.sqrt(2 * np.log(2)))
+        kernel_g = Gaussian1DKernel(sigma_g)
+
+        if len(flux) % 2 == 0:
+            x = np.linspace(0, len(flux), len(flux) - 1)
+        else:
+            x = np.linspace(0, len(flux), len(flux))
+        sigma_l = L_fwhm/pixel_spacing
+        kernel_l = Lorentz_Cauchy(sigma_l, x)
+
+        kernel_voigt = convolve(kernel_l, kernel_g, boundary='extend')
+        kernel_voigt_norm = kernel_voigt / sum(kernel_voigt)
+
+        Box = Box1DKernel(B_fwhm/pixel_spacing, mode='linear_interp')
+
+        kernel_not_normalized = convolve(kernel_voigt_norm, Box, boundary='extend')
+
+        kernel = kernel_not_normalized/ sum(kernel_not_normalized)
 
 
     Convolved_data = convolve(flux, kernel, boundary='extend')

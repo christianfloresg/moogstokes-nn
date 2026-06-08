@@ -69,7 +69,7 @@ def lnprior(p: NDArray) -> float:
 
 def fit_params_mcmc(spectrum: SpectralDataForMoogStokes, model_generator: MoogStokesNN,
              nwalkers: int = 64, nsteps: int = 4000, vsini: float | None = None) -> emcee.EnsembleSampler:
-    
+
     # set the vsini if there is a prior fit to it.
     if vsini is not None:
         ndim = 4
@@ -117,7 +117,7 @@ def retrieve_spectrum_preproc(basename, data_path="data/science", preparams_fnam
     with open(os.path.join(data_path, preparams_fname), newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row["filename"] == basename:                
+            if row["filename"] == basename:
                 shifts          = np.array([float(row[f"shift_{i}"]) for i in range(7)])
                 renormalization = np.array([float(row[f"renorm_{i}"]) for i in range(7)])
                 regions = range(7)
