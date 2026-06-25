@@ -6,7 +6,7 @@ TODO:
   and perform a cross-correlation with a model to find the shift instead of
   asking for the shift as a parameter... Would need to account for nan values
   in the data.
-- 
+-
 """
 
 import os
@@ -40,12 +40,12 @@ class SpectralData:
     def __init__(self, fname: str, name: str | None = None) -> None:
         """Initializes the SpectralData object by reading in data from
         a file.
-        
+
         If the name is not specified, it will be set by splitting the file
         name by '.' and taking the first item in the resulting list. For example,
         the fname "OW94-154-346.merged.smoothed.fits" will result in the name
         "OW94-154-346".
-        
+
         Parameters
         ----------
         fname: str
@@ -65,13 +65,17 @@ class SpectralData:
             data = fits.getdata(fname)
         else:
             raise ValueError(f"File type not recognized: {abs_path}")
-        
+
         if name is None:
             self.name = basename.split('.')[0]
         else:
             self.name = name
         self.x = data[0]
+        if np.median(self.x)<10:
+            self.x = self.x*1e4
         self.y = data[1]
+        if np.median(self.y>100):
+            self.y = self.y/np.median(self.y)
         self.yerr = data[2]
         self.yerr_scaling = 1.0   # Add this line
 
@@ -92,7 +96,7 @@ class SpectralData:
         """
         mask = (self.x >= xlo) & (self.x <= xhi)
         return self.x[mask], self.y[mask], self.yerr[mask]
-    
+
     def doppler_shift_data(self, shift: int, p: int = 50, fill_value: float = 1):
         """Applies a Doppler shift to the data. The y-values are padded with ones
         (or another fill_value) before rolling the array. Then, it is cropped
@@ -280,7 +284,7 @@ class ModelSpectrum:
         ----------
         xnew: array_like
             The new x-values to interpolate the model to.
-        
+
         Returns
         -------
         out: nd_array
@@ -289,7 +293,7 @@ class ModelSpectrum:
         xnew = np.array(xnew)
         itp = interp1d(self.x, self.y, kind="linear")
         return itp(xnew)
-    
+
     def apply_veiling(self, rK: float) -> None:
         """Applies veiling to the model spectrum. This modifies the y-values.
 
@@ -332,7 +336,7 @@ class MoogStokesModel(ModelSpectrum):
         xhis = [21194, 21804, 21919, 22108, 22339, 22682, 23042]
 
         return xlos[region], xhis[region]
-    
+
     @staticmethod
     def make_model_fname(
         Teff: float,
@@ -380,13 +384,13 @@ class MoogStokesModel(ModelSpectrum):
             top_dir = f"{h[:Ndig]}"
             second_dir = f"{h[Ndig:2*Ndig]}"
             fname = os.path.join(models_dir, top_dir, second_dir, dirname, basename)
-            
+
         else:
             fname = os.path.join(models_dir, dirname, basename)
 
             # # some of the folder names from the original grid are formatted with
             # # floats for vsini, so try this
-            # if not os.path.exists(fname): 
+            # if not os.path.exists(fname):
             #     dirname = 'iSHELL_0.75K2_T' + '{:d}'.format(Teff) + '_G' + '{:d}'.format(logg) \
             #         + "_Veil" + '{:.1f}'.format(rK) + '_Bf' + '{:.1f}'.format(B) \
             #             + '_vsin' + '{:.1f}'.format(vsini)
@@ -394,13 +398,13 @@ class MoogStokesModel(ModelSpectrum):
             #     fname2 = os.path.join(models_dir, dirname, basename)
             #     if os.path.exists(fname2):
             #         fname = fname2
-            
+
         return fname
-        
+
     def __init__(self, Teff: float, logg: float, rK: float, B: float, vsini: float,
                  region: int, use_interpolated: bool = True) -> None:
         """
-        
+
         Parameters
         ----------
         See ModelSpectrum.
@@ -432,7 +436,7 @@ class MoogStokesModel(ModelSpectrum):
                 self.x, self.y = self.get_model_data(self.Teff, self.logg, self.B, self.vsini, self.region, self.models_itp_dir, interpolated=True)
             else:
                 raise e
-            
+
         self.apply_veiling(self.rK)
         self.x *= 1e4  # convert microns to Angstroms
 
@@ -455,13 +459,13 @@ class MoogStokesModel(ModelSpectrum):
 
     def get_model_data(self, Teff, logg, B, vsini, region, models_dir, interpolated=False):
         """Retrieves the wavelength, flux data of the MoogStokes model.
-    
+
         Parameters
         ----------
         See ModelSpectrum.
         region: int
             Wavelength region.
-    
+
         Returns
         -------
         x: ndarray
@@ -528,7 +532,7 @@ class BTSettlModel(ModelSpectrum):
     References: Allard et al. 2011
     https://svo2.cab.inta-csic.es/theory/newov2/index.php?models=bt-settl-cifist
     """
-    
+
     @staticmethod
     def nrefrac(wl, density=1.0):
         """Returns the refractive index of air from the Cauchy formula.
@@ -541,19 +545,19 @@ class BTSettlModel(ModelSpectrum):
         wl: array_like
             The wavelengths in Angstroms.
         density: float
-            The density of air in amagat (relative to STP, e.g. ~10% decrease per 
+            The density of air in amagat (relative to STP, e.g. ~10% decrease per
             1000 m above sea level).
         """
         # The IAU standard for conversion from air to vacuum wavelengths is given
         # in Morton (1991, ApJS, 77, 119). For vacuum wavelengths (VAC) in
-        # Angstroms, convert to air wavelength (AIR) via: 
+        # Angstroms, convert to air wavelength (AIR) via:
 
         #  AIR = VAC / (1.0 + 2.735182E-4 + 131.4182 / VAC^2 + 2.76249E8 / VAC^4)
         wl2inv = (1e4/wl)**2
         refracstp = 272.643 + 1.2288 * wl2inv + 3.555e-2 * wl2inv**2
         n = (refracstp * density) * 1e-6 + 1
         return n
-    
+
     def __init__(self, Teff: float, logg: float, rK: float, mode: str = 'k2', models_dir: str ='data/bt-settl-cifist/'):
         """Creates the BTSettlModel object.
         """
@@ -564,15 +568,15 @@ class BTSettlModel(ModelSpectrum):
         self.x = data[0]
         self.y = data[1]
         self.apply_veiling(rK)
-    
+
     def retrieve_template_data(self, fname: str) -> tuple[NDArray, NDArray]:
         """Retrieves the wavelength, flux data from the brown dwarf model file.
-    
+
         Parameters
         ----------
         fname: str
             The name of the file containing the template spectrum.
-    
+
         Returns
         -------
         x: ndarray
@@ -589,13 +593,13 @@ class BTSettlModel(ModelSpectrum):
         else:
             raw = np.loadtxt(fname, skiprows=8).T
             x, y = raw[0,1:], raw[1,1:]     # Remove first element at wavelength = 0
-            x = x * self.nrefrac(x)         # Convert from air to vacuum wavelengths 
+            x = x * self.nrefrac(x)         # Convert from air to vacuum wavelengths
         return x, y
-    
+
     def get_norm_template_fname(self, Teff: float, logg: float, mode: str) -> str:
         """Returns a string containing the name of the continuum normalized template
         file.
-        
+
         Parameters
         ----------
         Teff: float
@@ -609,12 +613,12 @@ class BTSettlModel(ModelSpectrum):
         suf = '-0.0a+0.0.BT-Settl.spec.7.dat.nspec'
         fn = 'lte0' + '{:.1f}'.format(Teff/100) + '-' + '{:.1f}'.format(logg)
         return os.path.join(pre, fn + suf)
-    
-    
+
+
     def retrieve_norm_template(self, Teff: float, logg: float, mode: str) -> tuple[NDArray, NDArray]:
         """Retrieves the wavelength, flux data from a continuum normalized model
         brown dwarf spectrum given the temperature and surface gravity.
-    
+
         Parameters
         ----------
         t: float
@@ -626,7 +630,7 @@ class BTSettlModel(ModelSpectrum):
         """
         fname = self.get_norm_template_fname(Teff, logg, mode)
         return self.retrieve_template_data(fname)
-    
+
 def setup_regions_plot(label_regions=True):
     """
     Returns
@@ -638,7 +642,7 @@ def setup_regions_plot(label_regions=True):
     Nsub = Nreg  # number of subplots
     if Nreg % 2 != 0:
         Nsub += 1  ## need
-    
+
     fig, axs = plt.subplots(nrows=Nsub//2, ncols=2, figsize=(8.5,7))
     axs = axs.reshape(-1)
 
@@ -652,7 +656,7 @@ def setup_regions_plot(label_regions=True):
 
         if label_regions:
             ax.text(0.81, 0.05, f"Region {r}", transform=ax.transAxes, color='k')
-        
+
     fig.supxlabel(r"Wavelength ($\AA$)")
     fig.supylabel(r"Normalized Flux Density")
     plt.tight_layout()
@@ -698,7 +702,7 @@ class SpectralDataForMoogStokes(SpectralData):
         self.generate_moog_regions()
 
     def generate_moog_regions(self):
-        
+
         p = 50 # number of pixels to pad on either side for Doppler shifts
         self.moog_regions = {}
         for r in self.regions:
@@ -728,11 +732,11 @@ class SpectralDataForMoogStokes(SpectralData):
     def doppler_shift_data(self, shift: int, p: int = 50, fill_value: float = 1):
         super().doppler_shift_data(shift, p, fill_value)
         self.generate_moog_regions()
-    
+
     def rescale_yerr(self, factor: float):
         super().rescale_yerr(factor)
         self.generate_moog_regions()
-    
+
     def Nyquist_bin_spectrum(self, N: int = 3) -> None:
         super().Nyquist_bin_spectrum(N)
         self.generate_moog_regions()
