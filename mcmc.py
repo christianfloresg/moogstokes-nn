@@ -12,6 +12,9 @@ from typing import Union
 from nn_helpers import MoogStokesNN
 from spectra import SpectralDataForMoogStokes, MoogStokesModel, setup_regions_plot
 
+PARAM_NAMES_5D = ["Teff", "logg", "rK", "B", "vsini"]
+PARAM_NAMES_4D = ["Teff", "logg", "rK", "B"]
+
 def lnlike(p: NDArray, spectrum: SpectralDataForMoogStokes, model_generator: MoogStokesNN) -> float:
     ydata_all = []
     ymodel_all = []
@@ -78,7 +81,7 @@ def fit_params_mcmc(spectrum: SpectralDataForMoogStokes, model_generator: MoogSt
                             size=(nwalkers, ndim))
 
         sampler = emcee.EnsembleSampler(nwalkers, ndim, lnprob, args=(spectrum, model_generator, vsini))
-        sampler.run_mcmc(p0, nsteps)
+        sampler.run_mcmc(p0, nsteps,progress=True)
 
     else:
         ndim = 5
@@ -87,7 +90,7 @@ def fit_params_mcmc(spectrum: SpectralDataForMoogStokes, model_generator: MoogSt
                             size=(nwalkers, ndim))
 
         sampler = emcee.EnsembleSampler(nwalkers, ndim, lnprob, args=(spectrum, model_generator, None))
-        sampler.run_mcmc(p0, nsteps)
+        sampler.run_mcmc(p0, nsteps,progress=True)
     return sampler
 
 def save_mcmc_results(data_path, name, basename, flat_samples, medians, errs):
@@ -112,35 +115,210 @@ def load_mcmc_results(name, data_path="data/science"):
             "errs":         hdul["ERRS"].data,
         }
 
-def retrieve_spectrum_preproc(basename, data_path="data/science", preparams_fname="spectrum_params.csv"):
+def save_mcmc_results_extended(
+    data_path,
+    run_name,
+    basename,
+    flat_samples,
+    medians,
+    q16_q84,
+    metadata,
+):
+    outdir = os.path.join(data_path, "mcmc_outputs", run_name)
+    os.makedirs(outdir, exist_ok=True)
 
+    fits_path = os.path.join(outdir, f"{run_name}_mcmc.fits")
+
+    primary = fits.PrimaryHDU()
+    hdr = primary.header
+
+    hdr["RUNNAME"] = run_name
+    hdr["BASENAME"] = basename
+    hdr["NPARAM"] = len(medians)
+    hdr["NREG"] = metadata["n_regions"]
+    hdr["YERSCL"] = metadata["error_scale_factor"]
+    hdr["CHI2_0"] = metadata["chi2_initial"]
+    hdr["RCHI2_0"] = metadata["reduced_chi2_initial"]
+    hdr["CHI2_F"] = metadata["chi2_final"]
+    hdr["RCHI2_F"] = metadata["reduced_chi2_final"]
+    hdr["DOF"] = metadata["dof"]
+    hdr["NPIX"] = metadata["n_used_pixels"]
+
+    if metadata["fixed_vsini"] is not None:
+        hdr["FIXVSINI"] = metadata["fixed_vsini"]
+
+    hdr["KERNEL"] = str(metadata["kernel"])
+    hdr["NBIN"] = metadata["nyquist_bin"]
+
+    hdus = fits.HDUList([
+        primary,
+        fits.ImageHDU(data=flat_samples, name="CHAIN"),
+        fits.ImageHDU(data=medians, name="MEDIANS"),
+        fits.ImageHDU(data=q16_q84, name="PERCENTILES"),
+        fits.ImageHDU(data=np.array(metadata["regions"]), name="REGIONS"),
+        fits.ImageHDU(data=np.array(metadata["shifts"]), name="SHIFTS"),
+        fits.ImageHDU(data=np.array(metadata["renormalization"]), name="RENORM"),
+    ])
+
+    param_col = fits.Column(
+        name="param_name",
+        format="20A",
+        array=np.array(metadata["param_names"], dtype="S20"),
+    )
+    hdus.append(fits.BinTableHDU.from_columns([param_col], name="PARAM_NAMES"))
+
+    hdus.writeto(fits_path, overwrite=True)
+
+    return fits_path
+
+def retrieve_spectrum_preproc(
+    basename,
+    data_path="data/science",
+    preparams_fname="spectrum_params.csv",
+    regions_override=None,
+    return_metadata=False,
+):
     with open(os.path.join(data_path, preparams_fname), newline="") as f:
         reader = csv.DictReader(f)
+        record = None
         for row in reader:
             if row["filename"] == basename:
-                shifts          = np.array([float(row[f"shift_{i}"]) for i in range(7)])
-                renormalization = np.array([float(row[f"renorm_{i}"]) for i in range(7)])
-                regions = range(7)
-                #regions = np.array([0,1,2,4,5])
-                kernel = row["kernel"]
-                kernel = None
-                resolution = None
-                masks = {}
-                for i in range(7):
-                    raw = row[f"mask_{i}"]
-                    if raw and raw != "None":
-                        masks[i] = [tuple(m) for m in ast.literal_eval(raw)]
-                Nbin = int(row["nyquist_bin"])
+                record = row
+                break
 
+    if record is None:
+        raise ValueError(f"No preprocessing row found for {basename}")
+
+    shifts = np.array([float(record[f"shift_{i}"]) for i in range(7)])
+    renormalization = np.array([float(record[f"renorm_{i}"]) for i in range(7)])
+
+    if regions_override is None:
+        regions = list(ast.literal_eval(record["regions"]))
+    else:
+        regions = list(regions_override)
+
+    kernel = record["kernel"]
+    if kernel in ("None", "", None):
+        kernel = None
+
+    resolution = None
+    kernel = None
+
+    masks = {}
+    for i in range(7):
+        raw = record[f"mask_{i}"]
+        if raw and raw != "None":
+            masks[i] = [tuple(m) for m in ast.literal_eval(raw)]
+
+    Nbin = int(record["nyquist_bin"])
 
     data = SpectralDataForMoogStokes(
-        fname = os.path.join(data_path, basename),
+        fname=os.path.join(data_path, basename),
+        name=os.path.splitext(basename)[0],
         shifts=shifts,
         renormalization=renormalization,
         regions=regions,
         masks=masks,
         kernel=kernel,
-        resolution=resolution
+        resolution=resolution,
     )
     data.Nyquist_bin_spectrum(N=Nbin)
+
+    metadata = {
+        "basename": basename,
+        "regions": regions,
+        "n_regions": len(regions),
+        "shifts": shifts,
+        "renormalization": renormalization,
+        "masks": masks,
+        "nyquist_bin": Nbin,
+        "kernel": kernel,
+        "resolution": resolution,
+        "abs_path": data.abs_path,
+    }
+
+    if return_metadata:
+        return data, metadata
+
     return data
+
+def count_used_pixels(spectrum):
+    n = 0
+
+    for r in spectrum.regions:
+        x, y, yerr = spectrum.get_region(r)
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr)
+
+        masks = spectrum.masks.get(r, [])
+        if masks:
+            keep = np.zeros(len(x), dtype=bool)
+            for xlo, xhi in masks:
+                keep |= (x >= xlo) & (x <= xhi)
+            finite &= keep
+
+        n += np.count_nonzero(finite)
+
+    return n
+
+
+def full_params_from_sampled(medians, fixed_vsini=None):
+    if fixed_vsini is None:
+        return np.asarray(medians)
+
+    return np.array([
+        medians[0],      # Teff
+        medians[1],      # logg
+        medians[2],      # rK
+        medians[3],      # B
+        fixed_vsini,     # vsini
+    ])
+
+
+def compute_reduced_chi2(spectrum, model_generator, medians, fixed_vsini=None):
+    full_params = full_params_from_sampled(medians, fixed_vsini=fixed_vsini)
+
+    chi2 = -2.0 * lnlike(full_params, spectrum, model_generator)
+
+    n_pix = count_used_pixels(spectrum)
+    n_free = len(medians)
+    dof = n_pix - n_free
+
+    if dof <= 0:
+        raise ValueError(f"Non-positive degrees of freedom: n_pix={n_pix}, n_free={n_free}")
+
+    reduced_chi2 = chi2 / dof
+
+    return chi2, reduced_chi2, dof, n_pix
+
+# def retrieve_spectrum_preproc(basename, data_path="data/science", preparams_fname="spectrum_params.csv"):
+#
+#     with open(os.path.join(data_path, preparams_fname), newline="") as f:
+#         reader = csv.DictReader(f)
+#         for row in reader:
+#             if row["filename"] == basename:
+#                 shifts          = np.array([float(row[f"shift_{i}"]) for i in range(7)])
+#                 renormalization = np.array([float(row[f"renorm_{i}"]) for i in range(7)])
+#                 regions = range(7)
+#                 #regions = np.array([0,1,2,4,5])
+#                 kernel = row["kernel"]
+#                 kernel = None
+#                 resolution = None
+#                 masks = {}
+#                 for i in range(7):
+#                     raw = row[f"mask_{i}"]
+#                     if raw and raw != "None":
+#                         masks[i] = [tuple(m) for m in ast.literal_eval(raw)]
+#                 Nbin = int(row["nyquist_bin"])
+#
+#
+#     data = SpectralDataForMoogStokes(
+#         fname = os.path.join(data_path, basename),
+#         shifts=shifts,
+#         renormalization=renormalization,
+#         regions=regions,
+#         masks=masks,
+#         kernel=kernel,
+#         resolution=resolution
+#     )
+#     data.Nyquist_bin_spectrum(N=Nbin)
+#     return data
