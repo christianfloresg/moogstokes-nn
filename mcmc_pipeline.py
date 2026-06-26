@@ -1,6 +1,7 @@
-# from mcmc import *
 import os
 import csv
+from datetime import datetime
+
 import numpy as np
 
 from mcmc import (
@@ -16,6 +17,7 @@ from mcmc_plots import (
     save_trace_plot,
     save_corner_plot,
     save_bestfit_spectrum_plot,
+    save_residual_spectrum_plot,
 )
 
 def run_error_rescaled_mcmc(
@@ -27,9 +29,22 @@ def run_error_rescaled_mcmc(
     fixed_vsini=None,
     nwalkers=16,
     nsteps=1000,
-    discard=500,
-    thin=5,
+    scale_discard=500,
+    scale_thin=5,
 ):
+    """
+    Run the two-pass error-rescaled MCMC.
+
+    This function performs the expensive part:
+        1. first MCMC
+        2. estimate reduced chi2
+        3. rescale yerr
+        4. second MCMC
+
+    It does NOT decide the final discard used for plots/summary.
+    That is done later in postprocess_mcmc_run().
+    """
+
     # Load fresh data for this specific stage
     testdata, meta = retrieve_spectrum_preproc(
         basename,
@@ -47,13 +62,18 @@ def run_error_rescaled_mcmc(
         vsini=fixed_vsini,
     )
 
-    flat1 = sampler1.get_chain(discard=discard, thin=thin, flat=True)
-    med1 = np.median(flat1, axis=0)
+    flat1_for_scale = sampler1.get_chain(
+        discard=scale_discard,
+        thin=scale_thin,
+        flat=True,
+    )
+
+    med1_for_scale = np.median(flat1_for_scale, axis=0)
 
     chi2_1, redchi2_1, dof_1, n_pix_1 = compute_reduced_chi2(
         testdata,
         moognn,
-        med1,
+        med1_for_scale,
         fixed_vsini=fixed_vsini,
     )
 
@@ -62,7 +82,7 @@ def run_error_rescaled_mcmc(
     # Rescale errors and regenerate fitting regions
     testdata.rescale_yerr(errscale)
 
-    # Second pass: this is the posterior you should save/use
+    # Second pass: this is the final sampler you will postprocess later
     sampler2 = fit_params_mcmc(
         testdata,
         moognn,
@@ -71,55 +91,223 @@ def run_error_rescaled_mcmc(
         vsini=fixed_vsini,
     )
 
-    flat2 = sampler2.get_chain(discard=discard, thin=thin, flat=True)
-    med2 = np.median(flat2, axis=0)
-    q16_q84 = np.percentile(flat2, [16, 84], axis=0)
-
-    chi2_2, redchi2_2, dof_2, n_pix_2 = compute_reduced_chi2(
-        testdata,
-        moognn,
-        med2,
-        fixed_vsini=fixed_vsini,
-    )
-
     meta.update({
         "run_name": run_name,
         "fixed_vsini": fixed_vsini,
         "param_names": PARAM_NAMES_4D if fixed_vsini is not None else PARAM_NAMES_5D,
+
         "chi2_initial": chi2_1,
         "reduced_chi2_initial": redchi2_1,
         "error_scale_factor": errscale,
-        "chi2_final": chi2_2,
-        "reduced_chi2_final": redchi2_2,
-        "dof": dof_2,
-        "n_used_pixels": n_pix_2,
+
+        "dof_initial": dof_1,
+        "n_used_pixels_initial": n_pix_1,
+
+        "nwalkers": nwalkers,
+        "nsteps": nsteps,
+        "scale_discard": scale_discard,
+        "scale_thin": scale_thin,
     })
 
-    return testdata, sampler2, flat2, med2, q16_q84, meta
+    return {
+        "testdata": testdata,
+        "sampler": sampler2,
+        "metadata": meta,
+    }
+
+def postprocess_mcmc_run(
+    run_result,
+    basename,
+    source_name,
+    run_name,
+    stage,
+    moognn,
+    data_path="data/science",
+    discard=1000,
+    thin=5,
+    summary_csv=None,
+    timestamp=None,
+):
+    """
+    Postprocess an already-run sampler.
+
+    This is the cheap part. You can call it many times with different
+    discard/thin values without rerunning the MCMC.
+    """
+
+    if summary_csv is None:
+        summary_csv = os.path.join(
+            data_path,
+            "mcmc_outputs",
+            "mcmc_summary_extended.csv",
+        )
+
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    testdata = run_result["testdata"]
+    sampler = run_result["sampler"]
+    metadata = run_result["metadata"].copy()
+
+    fixed_vsini = metadata.get("fixed_vsini", None)
+
+    flat_samples = sampler.get_chain(
+        discard=discard,
+        thin=thin,
+        flat=True,
+    )
+
+    medians = np.median(flat_samples, axis=0)
+    q16_q84 = np.percentile(flat_samples, [16, 84], axis=0)
+
+    chi2_final, redchi2_final, dof_final, n_pix_final = compute_reduced_chi2(
+        testdata,
+        moognn,
+        medians,
+        fixed_vsini=fixed_vsini,
+    )
+
+    metadata.update({
+        "discard": discard,
+        "thin": thin,
+        "chi2_final": chi2_final,
+        "reduced_chi2_final": redchi2_final,
+        "dof": dof_final,
+        "n_used_pixels": n_pix_final,
+    })
+
+    outdir = os.path.join(data_path, "mcmc_outputs", run_name)
+    os.makedirs(outdir, exist_ok=True)
+
+    fits_file = save_mcmc_results_extended(
+        data_path=data_path,
+        run_name=f"{run_name}_{timestamp}_bin{metadata.get('nyquist_bin', 'NA')}_discard{discard}_thin{thin}",
+        basename=basename,
+        flat_samples=flat_samples,
+        medians=medians,
+        q16_q84=q16_q84,
+        metadata=metadata,
+    )
+
+    trace_plot = save_trace_plot(
+        sampler=sampler,
+        param_names=metadata["param_names"],
+        outdir=outdir,
+        run_name=run_name,
+        metadata=metadata,
+        discard=discard,
+        thin=thin,
+        timestamp=timestamp,
+    )
+
+    corner_plot = save_corner_plot(
+        flat_samples=flat_samples,
+        param_names=metadata["param_names"],
+        outdir=outdir,
+        run_name=run_name,
+        metadata=metadata,
+        discard=discard,
+        thin=thin,
+        timestamp=timestamp,
+    )
+
+    bestfit_plot = save_bestfit_spectrum_plot(
+        testdata=testdata,
+        moognn=moognn,
+        medians=medians,
+        outdir=outdir,
+        run_name=run_name,
+        fixed_vsini=fixed_vsini,
+        metadata=metadata,
+        discard=discard,
+        thin=thin,
+        timestamp=timestamp,
+    )
+
+    residual_plot = save_residual_spectrum_plot(
+        testdata=testdata,
+        moognn=moognn,
+        medians=medians,
+        outdir=outdir,
+        run_name=run_name,
+        fixed_vsini=fixed_vsini,
+        metadata=metadata,
+        discard=discard,
+        thin=thin,
+        timestamp=timestamp,
+    )
+
+    append_mcmc_summary_csv(
+        csv_path=summary_csv,
+        source_name=source_name,
+        basename=basename,
+        run_name=run_name,
+        stage=stage,
+        medians=medians,
+        errs=q16_q84,
+        metadata=metadata,
+        fits_file=fits_file,
+        trace_plot=trace_plot,
+        corner_plot=corner_plot,
+        bestfit_plot=bestfit_plot,
+        residual_plot=residual_plot,
+    )
+
+    return {
+        "run_name": run_name,
+        "stage": stage,
+        "flat_samples": flat_samples,
+        "medians": medians,
+        "percentiles": q16_q84,
+        "metadata": metadata,
+        "fits_file": fits_file,
+        "trace_plot": trace_plot,
+        "corner_plot": corner_plot,
+        "bestfit_plot": bestfit_plot,
+        "residual_plot": residual_plot,
+        "summary_csv": summary_csv,
+    }
 
 
-
-def run_two_stage_source(
+def run_two_stage_source_raw(
     basename,
     moognn,
     data_path="data/science",
     nwalkers=64,
     nsteps=4000,
-    discard=1000,
-    thin=5,
-    summary_csv=None,
+    scale_discard=1000,
+    scale_thin=5,
+    vsini_discard=1000,
+    vsini_thin=5,
+    stage2_fixed_vsini=None,
 ):
-    source_name = os.path.splitext(basename)[0]
+    """
+    Run Stage 1 and Stage 2, but do not save plots/summary yet.
 
-    if summary_csv is None:
-        summary_csv = os.path.join(data_path, "mcmc_outputs", "mcmc_summary_extended.csv")
+    Stage 1:
+        regions = [0, 1, 2, 3, 4, 5, 6]
+        free parameters = Teff, logg, rK, B, vsini
+
+    Stage 2:
+        regions = [0, 1, 2, 3, 4, 5]
+        free parameters = Teff, logg, rK, B
+        fixed vsini = either Stage 1 median vsini or manual value
+
+    Parameters
+    ----------
+    stage2_fixed_vsini : float or None
+        If None, Stage 2 uses the Stage 1 median vsini.
+        If float, Stage 2 uses this manually supplied vsini value.
+    """
+
+    source_name = os.path.splitext(basename)[0]
 
     # ============================================================
     # Stage 1: 7 regions, 5 free parameters
     # ============================================================
     stage1_name = f"{source_name}_stage1_7reg_5par"
 
-    data1, sampler1, flat1, med1, q1, meta1 = run_error_rescaled_mcmc(
+    stage1_raw = run_error_rescaled_mcmc(
         basename=basename,
         run_name=stage1_name,
         moognn=moognn,
@@ -128,69 +316,35 @@ def run_two_stage_source(
         fixed_vsini=None,
         nwalkers=nwalkers,
         nsteps=nsteps,
-        discard=discard,
-        thin=thin,
+        scale_discard=scale_discard,
+        scale_thin=scale_thin,
     )
 
-    fits1 = save_mcmc_results_extended(
-        data_path=data_path,
-        run_name=stage1_name,
-        basename=basename,
-        flat_samples=flat1,
-        medians=med1,
-        q16_q84=q1,
-        metadata=meta1,
-    )
+    # ============================================================
+    # Choose fixed vsini for Stage 2
+    # ============================================================
+    if stage2_fixed_vsini is None:
+        flat1_for_vsini = stage1_raw["sampler"].get_chain(
+            discard=vsini_discard,
+            thin=vsini_thin,
+            flat=True,
+        )
 
-    outdir1 = os.path.join(data_path, "mcmc_outputs", stage1_name)
+        med1_for_vsini = np.median(flat1_for_vsini, axis=0)
+        fixed_vsini = med1_for_vsini[4]
+        fixed_vsini_source = "stage1_median"
 
-    trace1 = save_trace_plot(
-        sampler=sampler1,
-        param_names=meta1["param_names"],
-        outdir=outdir1,
-        run_name=stage1_name,
-        discard=discard,
-    )
+    else:
+        fixed_vsini = float(stage2_fixed_vsini)
+        fixed_vsini_source = "manual"
 
-    corner1 = save_corner_plot(
-        flat_samples=flat1,
-        param_names=meta1["param_names"],
-        outdir=outdir1,
-        run_name=stage1_name,
-    )
-
-    bestfit1 = save_bestfit_spectrum_plot(
-        testdata=data1,
-        moognn=moognn,
-        medians=med1,
-        outdir=outdir1,
-        run_name=stage1_name,
-        fixed_vsini=None,
-    )
-
-    append_mcmc_summary_csv(
-        csv_path=summary_csv,
-        source_name=source_name,
-        basename=basename,
-        run_name=stage1_name,
-        stage="stage1_7regions_5params",
-        medians=med1,
-        errs=q1,
-        metadata=meta1,
-        fits_file=fits1,
-        trace_plot=trace1,
-        corner_plot=corner1,
-        bestfit_plot=bestfit1,
-    )
-
-    fixed_vsini = med1[4]
 
     # ============================================================
     # Stage 2: 6 regions, 4 free parameters, fixed vsini
     # ============================================================
     stage2_name = f"{source_name}_stage2_6reg_4par_fixedvsini"
 
-    data2, sampler2, flat2, med2, q2, meta2 = run_error_rescaled_mcmc(
+    stage2_raw = run_error_rescaled_mcmc(
         basename=basename,
         run_name=stage2_name,
         moognn=moognn,
@@ -199,83 +353,88 @@ def run_two_stage_source(
         fixed_vsini=fixed_vsini,
         nwalkers=nwalkers,
         nsteps=nsteps,
+        scale_discard=scale_discard,
+        scale_thin=scale_thin,
+    )
+
+    stage1_raw["name"] = stage1_name
+    stage1_raw["stage"] = "stage1_7regions_5params"
+
+    stage2_raw["name"] = stage2_name
+    stage2_raw["stage"] = "stage2_6regions_4params_fixed_vsini"
+
+    # Store provenance in Stage 2 metadata too
+    stage2_raw["metadata"]["fixed_vsini"] = fixed_vsini
+    stage2_raw["metadata"]["fixed_vsini_source"] = fixed_vsini_source
+    stage2_raw["metadata"]["vsini_discard"] = vsini_discard
+    stage2_raw["metadata"]["vsini_thin"] = vsini_thin
+
+    return {
+        "source_name": source_name,
+        "basename": basename,
+        "stage1": stage1_raw,
+        "stage2": stage2_raw,
+        "fixed_vsini": fixed_vsini,
+        "fixed_vsini_source": fixed_vsini_source,
+        "vsini_discard": vsini_discard,
+        "vsini_thin": vsini_thin,
+    }
+
+def postprocess_two_stage_results(
+    raw_results,
+    moognn,
+    data_path="data/science",
+    discard=1000,
+    thin=5,
+    summary_csv=None,
+    timestamp=None,
+):
+    """
+    Postprocess Stage 1 and Stage 2 with a chosen discard/thin.
+    You can call this many times without rerunning MCMC.
+    """
+
+
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    basename = raw_results["basename"]
+    source_name = raw_results["source_name"]
+
+    stage1_out = postprocess_mcmc_run(
+        run_result=raw_results["stage1"],
+        basename=basename,
+        source_name=source_name,
+        run_name=raw_results["stage1"]["name"],
+        stage=raw_results["stage1"]["stage"],
+        moognn=moognn,
+        data_path=data_path,
         discard=discard,
         thin=thin,
+        summary_csv=summary_csv,
+        timestamp=timestamp,
     )
 
-    fits2 = save_mcmc_results_extended(
-        data_path=data_path,
-        run_name=stage2_name,
+    stage2_out = postprocess_mcmc_run(
+        run_result=raw_results["stage2"],
         basename=basename,
-        flat_samples=flat2,
-        medians=med2,
-        q16_q84=q2,
-        metadata=meta2,
-    )
-
-    outdir2 = os.path.join(data_path, "mcmc_outputs", stage2_name)
-
-    trace2 = save_trace_plot(
-        sampler=sampler2,
-        param_names=meta2["param_names"],
-        outdir=outdir2,
-        run_name=stage2_name,
-        discard=discard,
-    )
-
-    corner2 = save_corner_plot(
-        flat_samples=flat2,
-        param_names=meta2["param_names"],
-        outdir=outdir2,
-        run_name=stage2_name,
-    )
-
-    bestfit2 = save_bestfit_spectrum_plot(
-        testdata=data2,
-        moognn=moognn,
-        medians=med2,
-        outdir=outdir2,
-        run_name=stage2_name,
-        fixed_vsini=fixed_vsini,
-    )
-
-    append_mcmc_summary_csv(
-        csv_path=summary_csv,
         source_name=source_name,
-        basename=basename,
-        run_name=stage2_name,
-        stage="stage2_6regions_4params_fixed_vsini",
-        medians=med2,
-        errs=q2,
-        metadata=meta2,
-        fits_file=fits2,
-        trace_plot=trace2,
-        corner_plot=corner2,
-        bestfit_plot=bestfit2,
+        run_name=raw_results["stage2"]["name"],
+        stage=raw_results["stage2"]["stage"],
+        moognn=moognn,
+        data_path=data_path,
+        discard=discard,
+        thin=thin,
+        summary_csv=summary_csv,
+        timestamp=timestamp,
     )
 
     return {
-        "stage1": {
-            "name": stage1_name,
-            "fits": fits1,
-            "trace_plot": trace1,
-            "corner_plot": corner1,
-            "bestfit_plot": bestfit1,
-            "medians": med1,
-            "percentiles": q1,
-            "metadata": meta1,
-        },
-        "stage2": {
-            "name": stage2_name,
-            "fits": fits2,
-            "trace_plot": trace2,
-            "corner_plot": corner2,
-            "bestfit_plot": bestfit2,
-            "medians": med2,
-            "percentiles": q2,
-            "metadata": meta2,
-        },
-        "summary_csv": summary_csv,
+        "stage1": stage1_out,
+        "stage2": stage2_out,
+        "summary_csv": stage1_out["summary_csv"],
+        "timestamp": timestamp,
+        "fixed_vsini": raw_results["fixed_vsini"],
     }
 
 def append_mcmc_summary_csv(
@@ -291,6 +450,7 @@ def append_mcmc_summary_csv(
     trace_plot=None,
     corner_plot=None,
     bestfit_plot=None,
+    residual_plot=None,
 ):
     """
     Append one MCMC result row to a human-readable CSV file.
@@ -371,6 +531,9 @@ def append_mcmc_summary_csv(
         "n_regions": metadata["n_regions"],
         "n_free_params": len(medians),
         "fixed_vsini": fixed_vsini,
+        "fixed_vsini_source": metadata.get("fixed_vsini_source"),
+        "vsini_discard": metadata.get("vsini_discard"),
+        "vsini_thin": metadata.get("vsini_thin"),
         "vsini_status": vsini_status,
 
         "Teff": Teff,
@@ -405,10 +568,19 @@ def append_mcmc_summary_csv(
         "renormalization": str(metadata.get("renormalization")),
         "masks": str(metadata.get("masks")),
 
+        "nwalkers": metadata.get("nwalkers"),
+        "nsteps": metadata.get("nsteps"),
+        "discard": metadata.get("discard"),
+        "thin": metadata.get("thin"),
+        "scale_discard": metadata.get("scale_discard"),
+        "scale_thin": metadata.get("scale_thin"),
+
         "fits_file": fits_file,
         "trace_plot": trace_plot,
         "corner_plot": corner_plot,
         "bestfit_plot": bestfit_plot,
+        "residual_plot": residual_plot,
+
     }
 
     file_exists = os.path.exists(csv_path)

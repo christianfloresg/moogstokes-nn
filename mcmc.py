@@ -144,6 +144,17 @@ def save_mcmc_results_extended(
     hdr["DOF"] = metadata["dof"]
     hdr["NPIX"] = metadata["n_used_pixels"]
 
+    hdr["NWALKER"] = metadata.get("nwalkers", -1)
+    hdr["NSTEPS"] = metadata.get("nsteps", -1)
+    hdr["DISCARD"] = metadata.get("discard", -1)
+    hdr["THIN"] = metadata.get("thin", -1)
+    hdr["SCLDISC"] = metadata.get("scale_discard", -1)
+    hdr["SCLTHIN"] = metadata.get("scale_thin", -1)
+
+    hdr["VSINSRC"] = str(metadata.get("fixed_vsini_source", "none"))
+    hdr["VSINDISC"] = metadata.get("vsini_discard", -1)
+    hdr["VSINTHIN"] = metadata.get("vsini_thin", -1)
+
     if metadata["fixed_vsini"] is not None:
         hdr["FIXVSINI"] = metadata["fixed_vsini"]
 
