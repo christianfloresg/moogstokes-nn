@@ -19,134 +19,6 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-try:
-    from scipy.optimize import minimize_scalar
-except Exception:
-    minimize_scalar = None
-
-
-def fractional_pixel_shift(arr, shift, fill_value=np.nan):
-    """Shift a 1D array by a possibly fractional number of pixels.
-
-    Positive shift follows the old np.roll convention approximately:
-    features move to larger pixel indices.
-    """
-    arr = np.asarray(arr, dtype=float)
-    idx = np.arange(arr.size, dtype=float)
-    return np.interp(idx - float(shift), idx, arr, left=fill_value, right=fill_value)
-
-
-def masked_chi2_for_shift(x_ext, y_ext, yerr_ext, model, region_xlims, shift, masks=None,
-                          y_fill=1.0):
-    """Chi2 for one trial sub-pixel shift in one spectral region."""
-    xlo, xhi = region_xlims
-    yerr_fill = np.nanmedian(yerr_ext[np.isfinite(yerr_ext)])
-    if not np.isfinite(yerr_fill) or yerr_fill <= 0:
-        yerr_fill = 1.0
-
-    y_shift = fractional_pixel_shift(y_ext, shift, fill_value=y_fill)
-    yerr_shift = fractional_pixel_shift(yerr_ext, shift, fill_value=yerr_fill)
-
-    in_region = (x_ext >= xlo) & (x_ext <= xhi)
-    x = x_ext[in_region]
-    y = y_shift[in_region]
-    yerr = yerr_shift[in_region]
-
-    if x.size == 0:
-        return np.inf
-
-    try:
-        ymodel = model.interpolate(x)
-    except Exception:
-        return np.inf
-
-    keep = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr) & np.isfinite(ymodel) & (yerr > 0)
-
-    if masks:
-        mask_keep = np.zeros(x.size, dtype=bool)
-        for xmask_lo, xmask_hi in masks:
-            mask_keep |= (x >= xmask_lo) & (x <= xmask_hi)
-        keep &= mask_keep
-
-    if np.count_nonzero(keep) < 5:
-        return np.inf
-
-    return np.nansum((y[keep] - ymodel[keep]) ** 2 / yerr[keep] ** 2)
-
-
-def optimize_subpixel_shift_for_region(data, moognn, region, model_params, current_shift=0.0,
-                                       renormalization=1.0, masks=None,
-                                       search_radius=10.0, coarse_step=0.25,
-                                       resolution=None, kernel=None):
-    """Robust continuous shift optimizer for one MoogStokes region.
-
-    The optimizer first scans a coarse grid, then refines the best point with
-    scipy.optimize.minimize_scalar. The returned value is in binned pixels,
-    i.e. the same units as the GUI shift boxes.
-    """
-    from spectra import MoogStokesModel
-
-    xlo, xhi = MoogStokesModel.region_xlims(region)
-    x_ext, y_ext, yerr_ext = data.get_range(xlo - 150, xhi + 150)
-
-    y_ext = np.asarray(y_ext, dtype=float) * float(renormalization)
-    yerr_ext = np.asarray(yerr_ext, dtype=float) * float(renormalization)
-
-    model = moognn.make_moogstokes_model(
-        Teff=model_params["Teff"],
-        logg=model_params["logg"],
-        rK=model_params["rK"],
-        B=model_params["B"],
-        vsini=model_params["vsini"],
-        region=region,
-    )
-
-    if resolution is not None or kernel is not None:
-        model.resolution_change(resolution=resolution, Kernel=kernel)
-
-    center = float(current_shift)
-    search_radius = abs(float(search_radius))
-    coarse_step = abs(float(coarse_step))
-    if coarse_step <= 0:
-        coarse_step = 0.25
-
-    grid = np.arange(center - search_radius, center + search_radius + 0.5 * coarse_step, coarse_step)
-
-    def objective(s):
-        return masked_chi2_for_shift(
-            x_ext=x_ext,
-            y_ext=y_ext,
-            yerr_ext=yerr_ext,
-            model=model,
-            region_xlims=(xlo, xhi),
-            shift=s,
-            masks=masks,
-            y_fill=1.0,
-        )
-
-    chi2_grid = np.array([objective(s) for s in grid])
-    if not np.any(np.isfinite(chi2_grid)):
-        return center, np.inf
-
-    best_grid_shift = float(grid[np.nanargmin(chi2_grid)])
-
-    # Refine only locally around the best grid point; this is more stable than
-    # asking a continuous optimizer to search a highly structured full interval.
-    left = max(center - search_radius, best_grid_shift - coarse_step)
-    right = min(center + search_radius, best_grid_shift + coarse_step)
-
-    if minimize_scalar is not None and right > left:
-        result = minimize_scalar(
-            objective,
-            bounds=(left, right),
-            method="bounded",
-            options={"xatol": 1e-3},
-        )
-        if result.success and np.isfinite(result.fun):
-            return float(result.x), float(result.fun)
-
-    return best_grid_shift, float(np.nanmin(chi2_grid))
-
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_REGIONS   = 7
 PARAMS_FILE = "data/spectrum_params.csv"
@@ -180,8 +52,6 @@ class SpectrumGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MoogStokes Spectrum Prep")
-        self.geometry("1250x850")
-        self.minsize(850, 650)
         self.resizable(True, True)
         self._csv_path_var = tk.StringVar(value=os.path.abspath(PARAMS_FILE))
         self._records = {}
@@ -196,20 +66,14 @@ class SpectrumGUI(tk.Tk):
         # Global undo history: list of region indices in insertion order
         self._mask_history  = []
         self._reload_csv(silent=True)
-        self._region_vars = []
-        self._shift_vars = []
-        self._renorm_vars = []
-        self._model_vars = {}
         self._build_ui()
-
         # Set trace after _build_ui so _status_var exists when it fires
         self._csv_path_var.trace_add("write", lambda *_: self._reload_csv())
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
         PAD = dict(padx=8, pady=4)
-        COMPACT_PAD = dict(padx=1, pady=2)
-        MODEL_PAD = dict(padx=2, pady=2)
+
         # Top pane: controls
         ctrl_frame = ttk.Frame(self, padding=10)
         ctrl_frame.pack(side="top", fill="x")
@@ -219,7 +83,7 @@ class SpectrumGUI(tk.Tk):
         # ── CSV path ──────────────────────────────────────────────────────────
         ttk.Label(ctrl_frame, text="Params CSV:").grid(
             row=row, column=0, sticky="w", **PAD)
-        ttk.Entry(ctrl_frame, textvariable=self._csv_path_var, width=36).grid(
+        ttk.Entry(ctrl_frame, textvariable=self._csv_path_var, width=56).grid(
             row=row, column=1, columnspan=N_REGIONS - 1, sticky="ew", **PAD)
         tk.Button(ctrl_frame, text="Browse…",
                   command=self._browse_csv, **BTN).grid(
@@ -234,12 +98,13 @@ class SpectrumGUI(tk.Tk):
         ttk.Label(ctrl_frame, text="Spectrum file:").grid(
             row=row, column=0, sticky="w", **PAD)
         self._file_var = tk.StringVar()
-        ttk.Entry(ctrl_frame, textvariable=self._file_var, width=20).grid(
+        ttk.Entry(ctrl_frame, textvariable=self._file_var, width=56).grid(
             row=row, column=1, columnspan=N_REGIONS - 2, sticky="ew", **PAD)
         tk.Button(ctrl_frame, text="Browse…", command=self._browse, **BTN).grid(
             row=row, column=N_REGIONS - 1, sticky="w", **PAD)
         tk.Button(ctrl_frame, text="Reload CSV", command=self._reload_csv, **BTN).grid(
             row=row, column=N_REGIONS, sticky="w", **PAD)
+        self._file_var.trace_add("write", lambda *_: self._on_file_change())
         row += 1
 
         ttk.Separator(ctrl_frame, orient="horizontal").grid(
@@ -267,8 +132,8 @@ class SpectrumGUI(tk.Tk):
         row += 1
         ttk.Label(ctrl_frame, text="").grid(row=row, column=0)
         for i in range(N_REGIONS):
-            ttk.Label(ctrl_frame, text=f"R{i}", anchor="center", width=5).grid(
-                row=row, column=i + 1, **COMPACT_PAD)
+            ttk.Label(ctrl_frame, text=f"R{i}", anchor="center", width=7).grid(
+                row=row, column=i + 1, **PAD)
         row += 1
 
         # ── Regions checkboxes ────────────────────────────────────────────────
@@ -277,8 +142,7 @@ class SpectrumGUI(tk.Tk):
         for i in range(N_REGIONS):
             v = tk.BooleanVar(value=True)
             self._region_vars.append(v)
-            ttk.Checkbutton(ctrl_frame, variable=v).grid(
-                row=row, column=i + 1, padx=1, pady=1)
+            ttk.Checkbutton(ctrl_frame, variable=v).grid(row=row, column=i + 1, **PAD)
         row += 1
 
         # ── Shifts ────────────────────────────────────────────────────────────
@@ -287,12 +151,8 @@ class SpectrumGUI(tk.Tk):
         for i in range(N_REGIONS):
             v = tk.StringVar(value="0")
             self._shift_vars.append(v)
-            ttk.Entry(
-                ctrl_frame,
-                textvariable=v,
-                width=6,
-                justify="center",
-            ).grid(row=row, column=i + 1, **COMPACT_PAD)
+            ttk.Entry(ctrl_frame, textvariable=v, width=7,
+                      justify="center").grid(row=row, column=i + 1, **PAD)
         row += 1
 
         # ── Renormalization ───────────────────────────────────────────────────
@@ -301,12 +161,8 @@ class SpectrumGUI(tk.Tk):
         for i in range(N_REGIONS):
             v = tk.StringVar(value="1.0")
             self._renorm_vars.append(v)
-            ttk.Entry(
-                ctrl_frame,
-                textvariable=v,
-                width=5,
-                justify="center",
-            ).grid(row=row, column=i + 1, **COMPACT_PAD)
+            ttk.Entry(ctrl_frame, textvariable=v, width=7,
+                      justify="center").grid(row=row, column=i + 1, **PAD)
         row += 1
 
         ttk.Separator(ctrl_frame, orient="horizontal").grid(
@@ -318,34 +174,16 @@ class SpectrumGUI(tk.Tk):
         model_frame.grid(row=row, column=0, columnspan=N_REGIONS + 1,
                          sticky="ew", **PAD)
         model_params = [("Teff", "3888"), ("logg", "3.74"), ("rK", "1.87"),
-                        ("B", "1.78"), ("vsini", "12.71"),
-                        ("guess_shift", "0"), ("shift_window", "10"),
-                        ("shift_step", "0.25"),
+                        ("B", "1.78"), ("vsini", "12.71"), ("guess_shift", "0"),
                         ("ymin", "0.75"), ("ymax", "1.05")]
         self._model_vars = {}
         for col, (label, default) in enumerate(model_params):
             ttk.Label(model_frame, text=f"{label}:").grid(
-                row=0,
-                column=col * 2,
-                sticky="e",
-                padx=(2, 1),
-                pady=2,
-            )
-
+                row=0, column=col * 2, sticky="e", padx=(8, 2))
             v = tk.StringVar(value=default)
             self._model_vars[label] = v
-
-            ttk.Entry(
-                model_frame,
-                textvariable=v,
-                width=6,
-                justify="center",
-            ).grid(
-                row=0,
-                column=col * 2 + 1,
-                padx=(0, 3),
-                pady=2,
-            )
+            ttk.Entry(model_frame, textvariable=v, width=8,
+                      justify="center").grid(row=0, column=col * 2 + 1, padx=(0, 8))
         row += 1
 
         # ── Buttons + status ──────────────────────────────────────────────────
@@ -362,70 +200,28 @@ class SpectrumGUI(tk.Tk):
         ttk.Label(bottom, textvariable=self._status_var,
                   foreground="gray").pack(side="left", padx=12)
 
-        # ── Embedded scrollable plot ──────────────────────────────────────────
-        # One long column gives much more horizontal room per region.
-        plot_outer = ttk.Frame(self)
-        plot_outer.pack(side="top", fill="both", expand=True)
+        # ── Embedded plot ─────────────────────────────────────────────────────
+        plot_frame = ttk.Frame(self)
+        plot_frame.pack(side="top", fill="both", expand=True)
 
-        self._plot_scroll = tk.Canvas(plot_outer, highlightthickness=0)
-        vbar = ttk.Scrollbar(plot_outer, orient="vertical", command=self._plot_scroll.yview)
-        self._plot_scroll.configure(yscrollcommand=vbar.set)
-
-        self._plot_scroll.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-
-        self._plot_frame = ttk.Frame(self._plot_scroll)
-        self._plot_window = self._plot_scroll.create_window(
-            (0, 0), window=self._plot_frame, anchor="nw"
-        )
-
-        def _update_scrollregion(_event=None):
-            self._plot_scroll.configure(scrollregion=self._plot_scroll.bbox("all"))
-
-        def _resize_inner_frame(event):
-            self._plot_scroll.itemconfigure(self._plot_window, width=event.width)
-
-        self._plot_frame.bind("<Configure>", _update_scrollregion)
-        self._plot_scroll.bind("<Configure>", _resize_inner_frame)
-        self._plot_scroll.bind_all("<MouseWheel>", self._on_mousewheel)
-        self._plot_scroll.bind_all("<Button-4>", self._on_mousewheel)
-        self._plot_scroll.bind_all("<Button-5>", self._on_mousewheel)
-
-        self._fig, axs = plt.subplots(
-            N_REGIONS, 1, figsize=(11.5, 3.0 * N_REGIONS), sharey=True
-        )
+        # Two-column grid; 7 regions → 4 rows × 2 cols, last cell hidden
+        self._fig, axs_grid = plt.subplots(4, 2, figsize=(8, 10), sharey=True)
         self._fig.patch.set_facecolor("#f0f0f0")
-        self._axs = np.atleast_1d(axs).flatten()
+        self._axs = axs_grid.flatten()
         for ax in self._axs:
             ax.set_visible(False)          # blank until first run
+        self._axs[N_REGIONS].set_visible(False)  # permanently hide spare cell
 
-        self._canvas = FigureCanvasTkAgg(self._fig, master=self._plot_frame)
+        self._canvas = FigureCanvasTkAgg(self._fig, master=plot_frame)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        toolbar_frame = ttk.Frame(self._plot_frame)
+        toolbar_frame = ttk.Frame(plot_frame)
         toolbar_frame.pack(fill="x")
         NavigationToolbar2Tk(self._canvas, toolbar_frame)
 
         # Mask interaction events
         self._canvas.mpl_connect("button_press_event", self._on_canvas_click)
         self.bind("<u>", lambda _e: self._undo_last_mask())
-
-        self._file_var.trace_add("write", lambda *_: self._on_file_change())
-
-    def _on_mousewheel(self, event):
-        """Scroll the long figure with the mouse wheel."""
-        # Do not steal the wheel while a matplotlib toolbar mode is active.
-        toolbar = getattr(self._canvas, "toolbar", None)
-        if toolbar is not None and toolbar.mode:
-            return
-
-        if getattr(event, "num", None) == 4:
-            delta = -1
-        elif getattr(event, "num", None) == 5:
-            delta = 1
-        else:
-            delta = int(-1 * (event.delta / 120))
-        self._plot_scroll.yview_scroll(delta, "units")
 
     # ── Mask interaction ──────────────────────────────────────────────────────
     def _on_canvas_click(self, event):
@@ -568,18 +364,6 @@ class SpectrumGUI(tk.Tk):
             self._file_var.set(path)
 
     def _on_file_change(self):
-        # This callback can fire during GUI construction or when loading a file.
-        # Do nothing until all region-control variables exist.
-        if (
-            not hasattr(self, "_shift_vars")
-            or not hasattr(self, "_renorm_vars")
-            or not hasattr(self, "_region_vars")
-            or len(self._shift_vars) < N_REGIONS
-            or len(self._renorm_vars) < N_REGIONS
-            or len(self._region_vars) < N_REGIONS
-        ):
-            return
-
         fname = self._file_var.get().strip()
         if not fname:
             return
@@ -684,75 +468,42 @@ class SpectrumGUI(tk.Tk):
             return
 
         fname, shifts, renorm, nyquist_bin = parsed
-        enabled = [i for i, v in enumerate(self._region_vars) if v.get()]
 
         try:
+            import copy
+            from fitting import automatic_wavelength_shifts_values
             from nn_helpers import MoogStokesNN
             from spectra import SpectralDataForMoogStokes
         except ImportError as e:
             messagebox.showerror("Import error", str(e))
             return
 
-        # Instantiate once and cache. This avoids reloading the NN every time.
-        if not hasattr(self, "_moognn"):
-            self._moognn = MoogStokesNN()
-
         try:
-            self._status_var.set("Computing sub-pixel auto shifts…")
+            self._status_var.set("Computing auto shifts…")
             self.update_idletasks()
 
-            # Load data with zero shifts. We optimize shifts explicitly below.
             obj = SpectralDataForMoogStokes(
                 fname,
                 name=os.path.splitext(os.path.basename(fname))[0],
                 regions=range(N_REGIONS),
-                shifts=np.zeros(N_REGIONS),
-                renormalization=np.ones(N_REGIONS),
+                shifts=np.array(shifts),
+                renormalization=np.array(renorm),
             )
             obj.Nyquist_bin_spectrum(nyquist_bin)
 
-            kernel = self._kernel_var.get()
-            if kernel in ("None", "", None):
-                kernel = None
-            # Keep this None unless your model-preview plots require convolution.
-            # If you use iSHELL0.75K2 in the MCMC pipeline with resolution=0.1,
-            # set resolution=0.1 here too for consistency.
-            resolution = None
-
-            search_radius = model.get("shift_window", 10.0)
-            coarse_step = model.get("shift_step", 0.25)
-
-            new_shifts = list(shifts)
-            chi2_values = []
-
-            for r in enabled:
-                current = shifts[r] if np.isfinite(shifts[r]) else model.get("guess_shift", 0.0)
-                best_shift, best_chi2 = optimize_subpixel_shift_for_region(
-                    data=obj,
-                    moognn=self._moognn,
-                    region=r,
-                    model_params=model,
-                    current_shift=current,
-                    renormalization=renorm[r],
-                    masks=self._masks[r],
-                    search_radius=search_radius,
-                    coarse_step=coarse_step,
-                    resolution=resolution,
-                    kernel=kernel,
-                )
-                new_shifts[r] = best_shift
-                chi2_values.append(best_chi2)
-
-            for v, s in zip(self._shift_vars, new_shifts):
-                v.set(f"{s:.3f}")
-
-            self._status_var.set(
-                f"Sub-pixel shifts applied to enabled regions. "
-                f"Median chi2={np.nanmedian(chi2_values):.3g}"
+            auto = automatic_wavelength_shifts_values(
+                copy.deepcopy(obj),
+                Teff=model["Teff"], logg=model["logg"],
+                rK=model["rK"], B=model["B"],
+                vsini=model["vsini"],
+                guess_shift=int(model["guess_shift"]),
+                use_nn=True,
             )
 
-            # Redraw immediately so the user can assess the alignment.
-            self._run()
+            for v, s in zip(self._shift_vars, auto):
+                v.set(f"{s:.4g}")
+
+            self._status_var.set("Auto shifts applied.")
 
         except Exception as e:
             messagebox.showerror("Runtime error", str(e))
@@ -803,24 +554,14 @@ class SpectrumGUI(tk.Tk):
                 )
                 model_color = "red" if r in enabled else "#aaaaaa"
                 model_label = "Model" if r in enabled else "Model (disabled)"
-                ymodel = testmodel.interpolate(x)
-                ax.plot(x, ymodel, color=model_color, label=model_label)
-
-                # Thin residual guide at the bottom of each panel. This helps
-                # diagnose sub-pixel misalignment without needing a second plot.
-                resid = y - ymodel
-                resid_offset = model["ymin"] + 0.06 * (model["ymax"] - model["ymin"])
-                resid_scale = 0.25 * (model["ymax"] - model["ymin"])
-                if np.nanmax(np.abs(resid)) > 0:
-                    ax.plot(x, resid_offset + resid / np.nanmax(np.abs(resid)) * resid_scale,
-                            color="tab:blue", alpha=0.65, lw=0.8, label="scaled residual")
+                ax.plot(testmodel.x, testmodel.y,
+                        color=model_color, label=model_label)
 
                 xlo, xhi = MoogStokesModel.region_xlims(r)
                 ax.set_xlim(xlo, xhi)
                 ax.set_ylim(model["ymin"], model["ymax"])
-                ax.set_title(f"R{r}   shift={float(shifts[r]):.3f} pix   renorm={float(renorm[r]):.4f}", fontsize=9)
-                ax.tick_params(labelsize=8)
-                ax.legend(fontsize=7, loc="best")
+                ax.set_title(f"R{r}", fontsize=9)
+                ax.tick_params(labelsize=7)
                 self._redraw_masks(r)
 
             self._fig.suptitle(

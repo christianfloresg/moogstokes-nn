@@ -22,17 +22,6 @@ from numpy.typing import NDArray
 from scipy.signal import savgol_filter
 from spectrograph_functions import instrumental_response
 
-
-def fractional_pixel_shift(arr, shift, fill_value=np.nan):
-    """Shift a 1D array by a possibly fractional number of pixels.
-
-    Positive shift follows the previous np.roll convention approximately:
-    spectral features move to larger pixel indices.
-    """
-    arr = np.asarray(arr, dtype=float)
-    idx = np.arange(arr.size, dtype=float)
-    return np.interp(idx - float(shift), idx, arr, left=fill_value, right=fill_value)
-
 class SpectralData:
     """Stores spectra of science targets.
 
@@ -126,12 +115,10 @@ class SpectralData:
         -------
         None
         """
-        yerr_fill = np.nanmedian(self.yerr[np.isfinite(self.yerr)])
-        if not np.isfinite(yerr_fill) or yerr_fill <= 0:
-            yerr_fill = 1.0
-
-        self.y = fractional_pixel_shift(self.y, shift, fill_value=fill_value)
-        self.yerr = fractional_pixel_shift(self.yerr, shift, fill_value=yerr_fill)
+        y_pad = np.pad(self.y, p, constant_values=fill_value)
+        yerr_pad = np.pad(self.yerr, p, constant_values=fill_value)
+        self.y = np.roll(y_pad, shift)[p:-p]
+        self.y_pad = np.roll(yerr_pad, shift)[p:-p]
 
     def rescale_yerr(self, factor: float):
         """
@@ -725,13 +712,11 @@ class SpectralDataForMoogStokes(SpectralData):
             yreg *= self.renormalization[r]
             yerrreg *= self.renormalization[r]
 
-            # Doppler shifts. Use fractional-pixel interpolation rather than
-            # integer np.roll, so GUI/MCMC shifts such as 2.37 pixels are honored.
-            yerr_fill = np.nanmedian(yerrreg[np.isfinite(yerrreg)])
-            if not np.isfinite(yerr_fill) or yerr_fill <= 0:
-                yerr_fill = 1.0
-            yreg_shifted = fractional_pixel_shift(yreg, self.shifts[r], fill_value=1.0)
-            yerrreg_shifted = fractional_pixel_shift(yerrreg, self.shifts[r], fill_value=yerr_fill)
+            # Doppler shifts
+            yreg_pad = np.pad(yreg, p, constant_values=1)
+            yerrreg_pad = np.pad(yerrreg, p, constant_values=1)
+            yreg_shifted = np.roll(yreg_pad, int(self.shifts[r]))[p:-p]
+            yerrreg_shifted = np.roll(yerrreg_pad, int(self.shifts[r]))[p:-p]
 
             # Crop down to original region limits
             xreg_mask = (xreg >= xlo) & (xreg <= xhi)
