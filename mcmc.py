@@ -1,15 +1,21 @@
+from __future__ import annotations
+
 import ast
 import csv
+import json
 import os
-from typing import Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
 
 import emcee
 import numpy as np
 from astropy.io import fits
 from numpy.typing import NDArray
 
-from nn_helpers import MoogStokesNN
 from spectra import SpectralDataForMoogStokes
+
+if TYPE_CHECKING:
+    from nn_helpers import MoogStokesNN
 
 PARAM_ORDER = ["Teff", "logg", "rK", "B", "vsini"]
 PARAM_BOUNDS = {
@@ -165,6 +171,125 @@ def fit_params_mcmc(
     sampler.free_param_names = free_param_names
     sampler.fixed_params = fixed_params
     return sampler
+
+
+def _json_ready(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return value
+
+
+def save_mcmc_run(
+    outdir,
+    run_name,
+    sampler,
+    metadata=None,
+    timestamp=None,
+):
+    """Save the full emcee chain and log-probability arrays for later postprocessing."""
+    os.makedirs(outdir, exist_ok=True)
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    metadata = {} if metadata is None else dict(metadata)
+    free_param_names = list(getattr(sampler, "free_param_names", metadata.get("free_param_names", [])))
+    fixed_params = normalize_fixed_params(getattr(sampler, "fixed_params", metadata.get("fixed_params", {})))
+    fixed_param_names = list(fixed_params.keys())
+
+    chain = sampler.get_chain()
+    lnprob = sampler.get_log_prob()
+
+    metadata.update({
+        "run_name": run_name,
+        "timestamp": timestamp,
+        "free_param_names": free_param_names,
+        "fixed_params": fixed_params,
+        "chain_shape": list(chain.shape),
+        "lnprob_shape": list(lnprob.shape),
+    })
+
+    fname = os.path.join(outdir, f"{run_name}_{timestamp}_mcmc_run.npz")
+    np.savez_compressed(
+        fname,
+        chain=chain,
+        lnprob=lnprob,
+        free_param_names=np.array(free_param_names, dtype="U20"),
+        fixed_param_names=np.array(fixed_param_names, dtype="U20"),
+        fixed_values=np.array([fixed_params[k] for k in fixed_param_names], dtype=float),
+        metadata_json=np.array(json.dumps(_json_ready(metadata))),
+    )
+    return fname
+
+
+def load_mcmc_run(mcmc_run_file):
+    """Load a saved MCMC run file produced by save_mcmc_run()."""
+    with np.load(mcmc_run_file, allow_pickle=False) as payload:
+        chain = np.array(payload["chain"])
+        lnprob = np.array(payload["lnprob"])
+        free_param_names = [str(p) for p in payload["free_param_names"]]
+        fixed_param_names = [str(p) for p in payload["fixed_param_names"]]
+        fixed_values = np.array(payload["fixed_values"], dtype=float)
+        metadata = json.loads(str(payload["metadata_json"].item()))
+
+    fixed_params = {name: float(value) for name, value in zip(fixed_param_names, fixed_values)}
+    metadata["free_param_names"] = free_param_names
+    metadata["fixed_params"] = fixed_params
+    metadata["mcmc_run_file"] = mcmc_run_file
+
+    return {
+        "chain": chain,
+        "lnprob": lnprob,
+        "free_param_names": free_param_names,
+        "fixed_params": fixed_params,
+        "metadata": metadata,
+    }
+
+
+def flat_samples_from_chain(chain, discard=0, thin=1):
+    """Return flattened samples from a saved chain array with shape (step, walker, param)."""
+    if thin is None:
+        thin = 1
+    if discard is None:
+        discard = 0
+    chain = np.asarray(chain)
+    samples = chain[int(discard)::int(thin)]
+    if samples.size == 0:
+        raise ValueError(
+            f"No MCMC samples left after discard={discard}, thin={thin}; "
+            f"chain has {chain.shape[0]} steps."
+        )
+    return samples.reshape((-1, chain.shape[-1]))
+
+
+def flat_lnprob_from_array(lnprob, discard=0, thin=1):
+    """Return flattened log-probabilities from a saved lnprob array."""
+    if thin is None:
+        thin = 1
+    if discard is None:
+        discard = 0
+    lnprob = np.asarray(lnprob)
+    values = lnprob[int(discard)::int(thin)]
+    if values.size == 0:
+        raise ValueError(
+            f"No log-probability samples left after discard={discard}, thin={thin}; "
+            f"lnprob has {lnprob.shape[0]} steps."
+        )
+    return values.reshape(-1)
+
+
+def percentile_summary(flat_samples, best_percentile=50, uncertainty_percentiles=(16, 84)):
+    """Compute reusable best values and uncertainty bounds from flattened samples."""
+    if len(uncertainty_percentiles) != 2:
+        raise ValueError("uncertainty_percentiles must contain exactly two percentiles.")
+    best = np.percentile(flat_samples, best_percentile, axis=0)
+    bounds = np.percentile(flat_samples, list(uncertainty_percentiles), axis=0)
+    return best, bounds
 
 
 def retrieve_spectrum_preproc(

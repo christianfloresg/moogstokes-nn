@@ -22,9 +22,8 @@ def make_output_tag(metadata=None, discard=None, thin=None, timestamp=None):
     return "_".join(pieces)
 
 
-def save_trace_plot(sampler, param_names, outdir, run_name, metadata=None, discard=0, thin=None, timestamp=None):
+def save_trace_plot_from_chain(chain, param_names, outdir, run_name, metadata=None, discard=0, thin=None, timestamp=None):
     os.makedirs(outdir, exist_ok=True)
-    chain = sampler.get_chain()
     n_params = chain.shape[-1]
     fig, axes = plt.subplots(n_params, 1, figsize=(10, 2.2 * n_params), sharex=True)
     if n_params == 1:
@@ -45,9 +44,34 @@ def save_trace_plot(sampler, param_names, outdir, run_name, metadata=None, disca
     return fname
 
 
-def save_corner_plot(flat_samples, param_names, outdir, run_name, metadata=None, discard=None, thin=None, timestamp=None):
+def save_trace_plot(sampler, param_names, outdir, run_name, metadata=None, discard=0, thin=None, timestamp=None):
+    return save_trace_plot_from_chain(
+        sampler.get_chain(),
+        param_names=param_names,
+        outdir=outdir,
+        run_name=run_name,
+        metadata=metadata,
+        discard=discard,
+        thin=thin,
+        timestamp=timestamp,
+    )
+
+
+def save_corner_plot(
+    flat_samples,
+    param_names,
+    outdir,
+    run_name,
+    metadata=None,
+    discard=None,
+    thin=None,
+    timestamp=None,
+    quantiles=None,
+):
     os.makedirs(outdir, exist_ok=True)
-    fig = corner.corner(flat_samples, labels=param_names, show_titles=True, quantiles=[0.16, 0.5, 0.84])
+    if quantiles is None:
+        quantiles = [0.16, 0.5, 0.84]
+    fig = corner.corner(flat_samples, labels=param_names, show_titles=True, quantiles=quantiles)
     tag = make_output_tag(metadata=metadata, discard=discard, thin=thin, timestamp=timestamp)
     fname = os.path.join(outdir, f"{run_name}_{tag}_corner.png")
     fig.savefig(fname, dpi=200, bbox_inches="tight")
